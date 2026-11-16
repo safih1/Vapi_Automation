@@ -1,0 +1,839 @@
+{
+  "name": "Logicfast Outreach Calling Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## A. OUTBOUND CALLER\nButton or every 30 min -> read sheet -> pick eligible leads (calling hours, do-not-call, max 2 retries) -> mark row 'calling' -> VAPI call.\nSettings (hours, retries, IDs) live at the top of the **Select Next Lead** code node.",
+        "height": 190,
+        "width": 760,
+        "color": 4
+      },
+      "id": "9d4066aa-2675-4763-aa01-6f72b49bac2f",
+      "name": "Note A",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        32,
+        880
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "fd262bc8-3f38-4933-ad33-85383b924b35",
+      "name": "Run Now (button)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -48,
+        1168
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "5eda09a9-8bef-443e-87e1-0443a40d5cfa",
+      "name": "Every 30 min1",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -64,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs",
+          "mode": "list",
+          "cachedResultName": "leads_dummy",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 947498253,
+          "mode": "list",
+          "cachedResultName": "leads_dummy.csv",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit#gid=947498253"
+        },
+        "options": {}
+      },
+      "id": "fbe8ae70-a41e-4ba7-9eab-6bfebc4b80b1",
+      "name": "Get Leads1",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        160,
+        1248
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "hxtIlFmklZXQNNkr",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== CONFIG: edit everything here =====\nconst CONFIG = {\n  enforceCallingHours: false,  // TESTING ONLY: set back to true before submission\n  timezone: 'Asia/Karachi',\n  startHour: 10,               // calls allowed from 10:00 ...\n  endHour: 18,                 // ... until 17:59\n  allowedDays: [1, 2, 3, 4, 5, 6], // Mon=1 ... Sun=7 (Sunday off)\n  maxAttempts: 3,              // 1 first call + 2 retries\n  retryGapMinutes: 120,        // wait before retrying a no-answer / error\n  staleCallMinutes: 20,        // \"calling\" this long with no webhook = lost call\n  maxCallsPerRun: 2,\n  defaultCountryCode: '92',\n  assistantId: '2b7eda6c-a333-4ab1-8050-ba81c6bc3c98',\n  phoneNumberId: '4221c6cb-c926-4ecc-b468-87a0fb5190e6',\n};\n\n// ===== 1. Calling-hours guard =====\nif (CONFIG.enforceCallingHours) {\n  const parts = new Intl.DateTimeFormat('en-GB', {\n    timeZone: CONFIG.timezone, hour: 'numeric', hour12: false, weekday: 'short',\n  }).formatToParts(new Date());\n  const hour = parseInt(parts.find(p => p.type === 'hour').value, 10) % 24;\n  const dayMap = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };\n  const day = dayMap[parts.find(p => p.type === 'weekday').value];\n  if (!CONFIG.allowedDays.includes(day) || hour < CONFIG.startHour || hour >= CONFIG.endHour) {\n    return []; // outside calling hours: no calls\n  }\n}\n\n// ===== 2. Helpers =====\nconst rows = $input.all().map(i => i.json).filter(r => r.id && r.number);\nconst isTrue = v => ['true', 'yes', '1', 'y'].includes(String(v || '').trim().toLowerCase());\nconst norm = n => {\n  const d = String(n || '').replace(/[^\\d+]/g, '');\n  if (d.startsWith('+')) return d;\n  if (d.startsWith('00')) return '+' + d.slice(2);\n  if (d.startsWith('0')) return '+' + CONFIG.defaultCountryCode + d.slice(1);\n  return '+' + d;\n};\n\n// ===== 3. Do-not-call list (by NUMBER, so duplicates are blocked too) =====\nconst dnc = new Set(\n  rows.filter(r => isTrue(r.do_not_call) || String(r.status).trim().toLowerCase() === 'do_not_call')\n      .map(r => norm(r.number))\n);\n\n// ===== 4. Pick eligible leads =====\nconst nowMs = Date.now();\nconst out = [];\nlet calls = 0;\nfor (const r of rows) {\n  if (calls >= CONFIG.maxCallsPerRun) break;\n  const number = norm(r.number);\n  if (dnc.has(number)) continue;\n\n  const status = String(r.status || 'pending').trim().toLowerCase();\n  const attempts = parseInt(r.attempts || 0, 10) || 0;\n  const last = Date.parse(r.last_call_time);\n  const minsSince = isNaN(last) ? Infinity : (nowMs - last) / 60000;\n  let note = '';\n\n  if (status === 'calling') {\n    if (minsSince < CONFIG.staleCallMinutes) continue;       // call still in progress\n    note = 'No end-of-call report received (timeout)';\n  } else if (status === 'callback') {\n    const cb = Date.parse(r.callback_time);\n    if (isNaN(cb) || cb > nowMs) continue;                   // callback not due yet\n    if (attempts >= CONFIG.maxAttempts) continue;\n  } else if (['pending', 'no_answer', 'error'].includes(status)) {\n    if (attempts >= CONFIG.maxAttempts && status !== 'calling') continue;\n    if (attempts > 0 && minsSince < CONFIG.retryGapMinutes) continue;\n  } else {\n    continue; // interested / not_interested / do_not_call: finished\n  }\n\n  // A lost call that already used all attempts is closed as an error, not re-dialled\n  const skip = status === 'calling' && attempts >= CONFIG.maxAttempts;\n  if (!skip) calls++;\n  out.push({ json: {\n    id: r.id, name: r.name, company: r.company, number,\n    new_attempts: skip ? attempts : attempts + 1,\n    new_status: skip ? 'error' : 'calling',\n    skip_call: skip,\n    error_note: note,\n    now_iso: new Date().toISOString(),\n    assistant_id: CONFIG.assistantId,\n    phone_number_id: CONFIG.phoneNumberId,\n  }});\n}\nreturn out;\n"
+      },
+      "id": "bdde00b3-1313-4fe6-b8f9-966d256837cf",
+      "name": "Select Next Lead1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        368,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs",
+          "mode": "list",
+          "cachedResultName": "leads_dummy",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 947498253,
+          "mode": "list",
+          "cachedResultName": "leads_dummy.csv",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit#gid=947498253"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.id }}",
+            "status": "={{ $json.new_status }}",
+            "attempts": "={{ $json.new_attempts }}",
+            "last_call_time": "={{ $json.now_iso }}",
+            "error": "={{ $json.error_note }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "name",
+              "displayName": "name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "number",
+              "displayName": "number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company",
+              "displayName": "company",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "attempts",
+              "displayName": "attempts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "last_call_time",
+              "displayName": "last_call_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "call_id",
+              "displayName": "call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "outcome",
+              "displayName": "outcome",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "callback_time",
+              "displayName": "callback_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "unanswered_questions",
+              "displayName": "unanswered_questions",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "do_not_call",
+              "displayName": "do_not_call",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "error",
+              "displayName": "error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "id": "f87796c3-e976-486e-b649-d94ba11e2126",
+      "name": "Mark Row Calling1",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        592,
+        1248
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "hxtIlFmklZXQNNkr",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "n-should-c",
+              "leftValue": "={{ $('Select Next Lead1').item.json.skip_call }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "08016e40-7aba-46b4-b2cd-ac7ab27c8791",
+      "name": "Should Call?1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        816,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs",
+          "mode": "list",
+          "cachedResultName": "leads_dummy",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 947498253,
+          "mode": "list",
+          "cachedResultName": "leads_dummy.csv",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit#gid=947498253"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Select Next Lead1').item.json.id }}",
+            "call_id": "={{ $json.id }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "name",
+              "displayName": "name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "number",
+              "displayName": "number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company",
+              "displayName": "company",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "attempts",
+              "displayName": "attempts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "last_call_time",
+              "displayName": "last_call_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "call_id",
+              "displayName": "call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "outcome",
+              "displayName": "outcome",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "callback_time",
+              "displayName": "callback_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "unanswered_questions",
+              "displayName": "unanswered_questions",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "do_not_call",
+              "displayName": "do_not_call",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "error",
+              "displayName": "error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "id": "8c9d70c9-e591-432b-9f8d-82046b5e0891",
+      "name": "Save Call ID1",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1248,
+        1136
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "hxtIlFmklZXQNNkr",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs",
+          "mode": "list",
+          "cachedResultName": "leads_dummy",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 947498253,
+          "mode": "list",
+          "cachedResultName": "leads_dummy.csv",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit#gid=947498253"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Select Next Lead1').item.json.id }}",
+            "status": "error",
+            "error": "={{ 'VAPI call failed: ' + String(($json.error && $json.error.message) || JSON.stringify($json)).slice(0, 250) }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "name",
+              "displayName": "name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "number",
+              "displayName": "number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company",
+              "displayName": "company",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "attempts",
+              "displayName": "attempts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "last_call_time",
+              "displayName": "last_call_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "call_id",
+              "displayName": "call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "outcome",
+              "displayName": "outcome",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "callback_time",
+              "displayName": "callback_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "unanswered_questions",
+              "displayName": "unanswered_questions",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "do_not_call",
+              "displayName": "do_not_call",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "error",
+              "displayName": "error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "id": "f1ad1ae9-099f-4a3f-a947-eb9f0cb90b19",
+      "name": "Write Call Error1",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1248,
+        1328
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "hxtIlFmklZXQNNkr",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.vapi.ai/call",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  assistantId: $('Select Next Lead1').item.json.assistant_id,\n  phoneNumberId: $('Select Next Lead1').item.json.phone_number_id,\n  customer: { number: $('Select Next Lead1').item.json.number, name: $('Select Next Lead1').item.json.name },\n  assistantOverrides: { variableValues: { name: $('Select Next Lead1').item.json.name, company: $('Select Next Lead1').item.json.company } }\n}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "a9b8354a-274b-4b08-abdd-d23da044232d",
+      "name": "VAPI Outbound Call2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1008,
+        1248
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "1lDBUdlpoTQtj632",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Run Now (button)": {
+      "main": [
+        [
+          {
+            "node": "Get Leads1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 30 min1": {
+      "main": [
+        [
+          {
+            "node": "Get Leads1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Leads1": {
+      "main": [
+        [
+          {
+            "node": "Select Next Lead1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select Next Lead1": {
+      "main": [
+        [
+          {
+            "node": "Mark Row Calling1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Row Calling1": {
+      "main": [
+        [
+          {
+            "node": "Should Call?1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Call?1": {
+      "main": [
+        [
+          {
+            "node": "VAPI Outbound Call2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VAPI Outbound Call2": {
+      "main": [
+        [
+          {
+            "node": "Save Call ID1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write Call Error1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "66646f38-8d4b-4b44-8bfe-bac661a22e95",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "6902e8e8d8a90e5b4e418817f9aba08bc3c7cc947dc709c2a5b86c1ce6b4be7e"
+  },
+  "nodeGroups": [],
+  "id": "mbmAQqUpiW3MFnUB",
+  "tags": []
+}

@@ -1,0 +1,2128 @@
+{
+  "name": "webhook after call end",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vapi-end-of-call",
+        "authentication": "headerAuth",
+        "options": {}
+      },
+      "id": "a75e9e35-1730-469f-90ea-8e5beb52c9f7",
+      "name": "VAPI Webhook1",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        880
+      ],
+      "webhookId": "vapi-end-of-call-0001",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "BOSyUbAEoDlO0naz",
+          "name": "Header Auth account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e-isrep-c",
+              "leftValue": "={{ $json.body?.message?.type }}",
+              "rightValue": "end-of-call-report",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "36f9dc8d-5e0f-4e96-911a-b582eaa1363d",
+      "name": "End-of-Call Report?1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -96,
+        880
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const TZ = 'Asia/Karachi';\nconst body = $json.body || $json;\nconst msg = body.message || {};\nconst call = msg.call || {};\nconst callId = call.id || ('unknown-' + Date.now());   // never blank: a blank id could match an empty row\nconst hasRealCallId = !!call.id;\nconst customerNumber = (call.customer && call.customer.number) || (msg.customer && msg.customer.number) || '';\nconst customerName = (call.customer && call.customer.name) || (msg.customer && msg.customer.name) || '';\nconst endedReason = msg.endedReason || call.endedReason || '';\nconst transcript = String((msg.artifact && msg.artifact.transcript) || msg.transcript || '').slice(0, 20000);\n\n// Lines spoken by the lead only (used for the opt-out safety net)\nconst userLines = transcript.split('\\n').filter(l => /^\\s*(user|customer)\\s*:/i.test(l));\nconst userText = userLines.join('\\n');\n\nconst NO_ANSWER = /(did-not-answer|busy|voicemail|no-answer)/i;\nconst FAILED = /(error|failed|not-found|invalid|unauthorized)/i;\n\nlet route = 'llm', error = '';\nif (!hasRealCallId) { route = 'error'; error = 'Webhook payload has no call id'; }\nelse if (NO_ANSWER.test(endedReason)) route = 'no_answer';\nelse if (FAILED.test(endedReason)) { route = 'error'; error = 'Call failed: ' + endedReason; }\nelse if (!transcript.trim()) { route = 'error'; error = 'Transcript missing (ended: ' + endedReason + ')'; }\nelse if (userLines.length === 0) route = 'no_answer';\n\nconst nowLocal = new Date().toLocaleString('en-GB', { timeZone: TZ, hour12: false });\n\nconst system = `You extract structured data from a phone-call transcript between an AI sales assistant (\"AI\") and a lead (\"User\") for Logicfast, an AI automation company. The call may be in English, Urdu, Roman Urdu, or a mix.\n\nReturn JSON with these fields:\n- outcome: one of \"interested\", \"not_interested\", \"callback\", \"opt_out\", \"no_answer\".\n  * interested: the lead wants more info, a demo, a meeting, or agrees that the Logicfast team may contact them.\n  * not_interested: the lead declines but does NOT forbid future calls.\n  * callback: the lead is busy or asks to be called at another time.\n  * opt_out: the lead asks not to be called again, to be removed from the list, or to stop calls, in ANY wording or language (for example \"dobara call mat karna\", \"remove my number\", \"stop calling me\").\n  * no_answer: the lead never meaningfully spoke (silence, voicemail, hang-up with no content).\n- contact_name: the lead's own name if they said it during the call (for example when the AI asked \"Aap ka naam kya hai?\"), otherwise null. Write it in Latin letters (transliterate from Urdu).\n- contact_phone: a phone number the lead gave during the call, converted to digits (Pakistani numbers as +92XXXXXXXXXX), otherwise null.\n- callback_time: ISO 8601 with +05:00 offset, resolved against the current date/time given below, if the lead named a time to be called back. Otherwise null. If the time is vague (for example \"later\"), use null.\n- summary: ONE line in English, maximum 25 words.\n- unanswered_questions: array of questions the lead asked that the AI could not answer or deferred to the team. Empty array if none.\n- opt_out: true if the lead asked not to be called again, otherwise false.\n\nRules:\n- Use only what is in the transcript. Never invent facts.\n- Priority if several apply: opt_out, then callback, then interested, then not_interested.\n- If outcome is \"opt_out\", opt_out must be true.\n- \"Not now, call me tomorrow\" is callback, not opt_out.`;\n\nconst userMsg = `Current date/time (Pakistan, Asia/Karachi): ${nowLocal}\\n\\nTRANSCRIPT:\\n${transcript}`;\n\nconst schema = {\n  type: 'OBJECT',\n  properties: {\n    outcome: { type: 'STRING', enum: ['interested', 'not_interested', 'callback', 'opt_out', 'no_answer'] },\n    callback_time: { type: 'STRING', nullable: true },\n    summary: { type: 'STRING' },\n    unanswered_questions: { type: 'ARRAY', items: { type: 'STRING' } },\n    opt_out: { type: 'BOOLEAN' },\n    contact_name: { type: 'STRING', nullable: true },\n    contact_phone: { type: 'STRING', nullable: true },\n  },\n  required: ['outcome', 'callback_time', 'summary', 'unanswered_questions', 'opt_out', 'contact_name', 'contact_phone'],\n};\n\nconst llmBody = {\n  systemInstruction: { parts: [{ text: system }] },\n  contents: [{ role: 'user', parts: [{ text: userMsg }] }],\n  generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema: schema },\n};\n\nreturn [{ json: { callId, endedReason, transcript, userText, route, error, customerName, customerNumber, llmBody } }];\n"
+      },
+      "id": "109cbf93-aa84-4781-bf8d-f052563cc125",
+      "name": "Parse Report1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        128,
+        880
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e-tok-c",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "llm",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ae63a790-a589-4218-b19c-88f1c34b85d1",
+      "name": "Transcript OK?1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        352,
+        880
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nconst na = r.route === 'no_answer';\nreturn [{ json: {\n  call_id: r.callId,\n  name: r.customerName || '',\n  number: r.customerNumber || '',\n  status: na ? 'no_answer' : 'error',\n  outcome: na ? 'no_answer' : '',\n  callback_time: '',\n  summary: na ? ('No answer (' + (r.endedReason || 'no speech') + ')') : '',\n  unanswered_questions: '',\n  do_not_call: '',\n  error: na ? '' : r.error,\n}}];\n"
+      },
+      "id": "bb8fe0d4-9783-4744-b9ff-96d18cb39098",
+      "name": "Build Non-Transcript Result1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        1072
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llmBody) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "f6fae1f9-3cda-46ec-a17f-117d30695af0",
+      "name": "Gemini Extract1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        576,
+        784
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "BOSyUbAEoDlO0naz",
+          "name": "Header Auth account 2"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Parse Report1').item.json;\nconst fail = msg => [{ json: {\n  call_id: p.callId, name: p.customerName || '', number: p.customerNumber || '', status: 'error', outcome: '', callback_time: '',\n  summary: '', unanswered_questions: '', do_not_call: '', error: msg,\n}}];\n\nlet data;\ntry {\n  const text = $json.candidates[0].content.parts.map(x => x.text || '').join('');\n  data = JSON.parse(text.replace(/```json|```/g, '').trim());\n} catch (e) {\n  return fail('LLM output was not valid JSON: ' + e.message);\n}\n\nconst OUTCOMES = ['interested', 'not_interested', 'callback', 'opt_out', 'no_answer'];\nif (!OUTCOMES.includes(data.outcome)) return fail('LLM returned invalid outcome: ' + data.outcome);\n\n// Opt-out safety net: even if the LLM misses it, phrases spoken by the LEAD force do-not-call\nconst OPT = /(do not call (me )?again|don'?t call (me )?again|stop calling|remove (me|my number)|take me off|unsubscribe|do?bara (call|phone) (mat|na)|dubara (call|phone) (mat|na))/i;\nconst optOut = data.opt_out === true || data.outcome === 'opt_out' || OPT.test(p.userText || '');\n\n// Name/number: use what the call carried (n8n-started calls); fall back to what the lead said (web/test calls)\nconst cleanPhone = String(data.contact_phone || '').replace(/[^\\d+]/g, '');\nreturn [{ json: {\n  call_id: p.callId,\n  name: p.customerName || data.contact_name || '',\n  number: p.customerNumber || cleanPhone || '',\n  status: optOut ? 'do_not_call' : data.outcome,\n  outcome: optOut ? 'opt_out' : data.outcome,\n  callback_time: optOut ? '' : (data.callback_time || ''),\n  summary: data.summary || '',\n  unanswered_questions: Array.isArray(data.unanswered_questions) ? data.unanswered_questions.join(' | ') : '',\n  do_not_call: optOut ? 'TRUE' : '',\n  error: '',\n}}];\n"
+      },
+      "id": "79cfd16f-f384-4b83-b25a-7c5d6a50d093",
+      "name": "Build Final Result1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        688
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Parse Report1').item.json;\nconst e = $json.error;\nconst detail = (e && (e.message || JSON.stringify(e))) || JSON.stringify($json);\nreturn [{ json: {\n  call_id: p.callId, name: p.customerName || '', number: p.customerNumber || '', status: 'error', outcome: '', callback_time: '',\n  summary: '', unanswered_questions: '', do_not_call: '',\n  error: ('LLM extraction failed: ' + detail).slice(0, 300),\n}}];\n"
+      },
+      "id": "7b0956b0-7676-4f05-a8d8-b47d709fcdb4",
+      "name": "Gemini Failed1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        880
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs",
+          "mode": "list",
+          "cachedResultName": "leads_dummy",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 947498253,
+          "mode": "list",
+          "cachedResultName": "leads_dummy.csv",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1jyJZTYFLDMSAls_zAz8q9xH6FvTNHETi01e3wBtiRxs/edit#gid=947498253"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "call_id": "={{ $json.call_id }}",
+            "name": "={{ $json.name }}",
+            "number": "={{ $json.number }}",
+            "status": "={{ $json.status }}",
+            "outcome": "={{ $json.outcome }}",
+            "callback_time": "={{ $json.callback_time }}",
+            "summary": "={{ $json.summary }}",
+            "unanswered_questions": "={{ $json.unanswered_questions }}",
+            "do_not_call": "={{ $json.do_not_call }}",
+            "error": "={{ $json.error }}"
+          },
+          "matchingColumns": [
+            "call_id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "name",
+              "displayName": "name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "number",
+              "displayName": "number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company",
+              "displayName": "company",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "attempts",
+              "displayName": "attempts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "last_call_time",
+              "displayName": "last_call_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "call_id",
+              "displayName": "call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "outcome",
+              "displayName": "outcome",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "callback_time",
+              "displayName": "callback_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "unanswered_questions",
+              "displayName": "unanswered_questions",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "do_not_call",
+              "displayName": "do_not_call",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "error",
+              "displayName": "error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "id": "a6e70944-1c04-410c-8419-f32a1f00b7a0",
+      "name": "Update Lead Row1",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1024,
+        880
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "hxtIlFmklZXQNNkr",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e-int-c",
+              "leftValue": "={{ $json.outcome }}",
+              "rightValue": "interested",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6156480f-935c-460a-b47f-7528826cf14b",
+      "name": "Interested?1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1248,
+        880
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ '🔥 Interested lead\\n' + $json.name + ' (' + $json.company + ')\\n' + $json.number + '\\n\\n' + $json.summary + ($json.unanswered_questions ? '\\n\\nOpen questions: ' + $json.unanswered_questions : '') }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "8f44f6eb-d688-4f4b-98d5-04e39b614c6b",
+      "name": "Telegram Alert1",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1488,
+        688
+      ],
+      "webhookId": "telegram-alert-0001",
+      "disabled": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "sendTo": "safihullah960@gmail.com",
+        "subject": "={{ 'Interested lead: ' + ($json.name || 'Unknown') + ($json.company ? ' (' + $json.company + ')' : '') }}",
+        "emailType": "text",
+        "message": "={{ 'Hello Logic Fast team,\\n\\nThe AI calling agent found an interested lead.\\n\\nName: ' + ($json.name || 'Not provided') + '\\nCompany: ' + ($json.company || 'Not provided') + '\\nPhone: ' + ($json.number || 'Not provided') + '\\n\\nSummary: ' + ($json.summary || '') + ($json.unanswered_questions ? '\\n\\nQuestions the AI could not answer: ' + $json.unanswered_questions : '') + '\\n\\nPlease follow up with this lead.\\n\\n(Automated message from the outreach calling agent)' }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "3152a03b-e201-49eb-b1a1-4d845e9e54a0",
+      "name": "Gmail Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1472,
+        880
+      ],
+      "webhookId": "gmail-alert-0001",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "ZxBFEET1bd0mPyqI",
+          "name": "Gmail account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {
+    "VAPI Webhook1": [
+      {
+        "json": {
+          "headers": {
+            "host": "safih1.app.n8n.cloud",
+            "user-agent": "axios/1.20.0",
+            "content-length": "63733",
+            "accept": "application/json, text/plain, */*",
+            "accept-encoding": "gzip, br",
+            "cdn-loop": "cloudflare; loops=1; subreqs=1",
+            "cf-connecting-ip": "44.247.227.14",
+            "cf-ew-via": "15",
+            "cf-ipcountry": "US",
+            "cf-ray": "a5b51ce4ba71495f-PDX",
+            "cf-visitor": "{\"scheme\":\"https\"}",
+            "cf-worker": "n8n.cloud",
+            "content-type": "application/json",
+            "cookie": "callId=01a1e376-048d-766a-a6a5-f4589f30fc3b",
+            "x-call-id": "01a1e376-048d-766a-a6a5-f4589f30fc3b",
+            "x-forwarded-for": "44.247.227.14, 172.68.174.5",
+            "x-forwarded-host": "safih1.app.n8n.cloud",
+            "x-forwarded-port": "443",
+            "x-forwarded-proto": "https",
+            "x-forwarded-server": "traefik-prod-users-swc-43-7779658889-85q7q",
+            "x-is-trusted": "yes",
+            "x-real-ip": "44.247.227.14",
+            "x-vapi-secret": ""
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "message": {
+              "timestamp": 1794817608407,
+              "type": "end-of-call-report",
+              "analysis": {},
+              "artifact": {
+                "messages": [
+                  {
+                    "role": "system",
+                    "message": "# FIRST MESSAGE (paste into the \"First Message\" field)\n\nAssalam-o-Alaikum! Main Logic Fast ka AI assistant hoon. Kya aap ke paas do minute hain?\n\n---\n\n# SYSTEM PROMPT (paste into the \"System Prompt\" field)\n\n# ROLE\nYou are the AI voice assistant of Logic Fast (spelled LogicFast in writing), a founder-led team in Gujranwala, Pakistan that builds websites, web apps, mobile apps and AI automations for businesses. You are making a short call to find out in 2 minutes or less whether Logic Fast's AI automation could help the person, and to note their interest. You are NOT here to sell hard or close a deal.\n\n# WHO YOU ARE CALLING\nDetails supplied for this call: name = {{name}}, company = {{company}}.\n- If a value is empty, missing, or still shows as a placeholder in curly braces, treat it as UNKNOWN. Never read a placeholder aloud.\n- NAME KNOWN: after they say they have two minutes, confirm once: \"Kya meri baat {{name}} se ho rahi hai?\" If they say no, ask politely for the right person or offer a callback.\n- NAME UNKNOWN: ask once: \"Aap ka naam kya hai?\" Then use their name naturally. Because the details are unknown, also ask for their company: \"Aap kis company ya business se hain?\"\n- If the name was unknown AND the person is interested or wants a callback, ask once before closing: \"Hamari team aap se rabta karne ke liye aap ka number kya hoga?\" Repeat the number back digit by digit to confirm.\n- If the name was known, do NOT ask for a phone number or any other personal data.\n\n# LANGUAGE AND STYLE\n- Speak in the same language the person uses: Urdu, Roman-Urdu style Hindi-Urdu, or English. Default to simple Urdu mixed with common English words.\n- Use gender-neutral phrasing for yourself (\"main Logic Fast ka AI assistant hoon\").\n- Say the company name as two words, \"Logic Fast\", clearly.\n- Sound warm, calm and respectful. Use \"aap\" always.\n- Keep every turn to 1-2 short sentences. Ask only ONE question at a time, then wait.\n- Never read lists aloud. Never use bullet points, markdown or emojis.\n\n# CALL FLOW\n1. OPENING (already spoken as the first message). If the person says it is the wrong person or a bad time, go to \"Callback\".\n2. If they have two minutes, handle \"WHO YOU ARE CALLING\" above (confirm the name, or ask for it).\n3. Ask these three questions, one at a time, reacting briefly to each answer:\n   a. \"Aap ke business mein kaun se kaam baar baar haath se karne parte hain, jaise leads follow-up, reports, ya customer messages?\"\n   b. \"Kya aap ne kabhi AI ya automation use karne ke baare mein socha hai?\"\n   c. \"Agar Logic Fast ki team, jis ko Bilal Naeem lead karte hain, aap se is baare mein baat kare, to kya aap ko theek lagega?\"\n4. If interested: (if details were unknown, collect the number as described above), thank them, say the team will contact them, and end the call.\n5. If not interested: thank them politely and end the call. Do not argue or try to change their mind more than once.\n\n# CALLBACK\nIf they are busy or ask to be called later, ask: \"Theek hai, aap kis din aur kis waqt call karna pasand karenge?\" Repeat the day and time back to confirm, thank them, and end the call. (If the name was unknown, also get their name and number as described above.)\n\n# OPT-OUT (HIGHEST PRIORITY)\nIf the person says anything like \"dobara call mat karo\", \"mujhe call na karein\", \"remove my number\", \"stop calling\" or \"do not call again\", in any language, stop immediately. Say once: \"Maazrat, main aap ka number abhi list se hata deti hoon, aap ko dobara call nahi aayegi. Shukriya, Allah hafiz.\" Then end the call. Do not ask why, and do not try to persuade them.\nA request like \"abhi nahi, kal call karna\" is a CALLBACK, not an opt-out.\n\n# WHAT YOU MAY SAY ABOUT LOGICFAST (only this, nothing more)\n- Logic Fast is a founder-led team in Gujranwala serving businesses across Pakistan. The founder, Bilal Naeem, personally leads every project.\n- Services: web development, AI automation, mobile apps, digital marketing, local SEO and Google Business Profile, website care and maintenance, and website security audits.\n- AI automation means practical automations that remove repetitive work, such as connecting workflows, processing documents, sorting enquiries, drafting routine messages and generating reports. Every automation includes human review checkpoints. If a task is not a good fit, they will say so honestly.\n- The price is always fixed and agreed in writing before work starts, with no hidden charges. A typical AI workflow automation is around PKR 50,000 to 150,000 and takes 2 to 4 weeks. The final quote depends on the scope.\n- The client owns the code, content, accounts and documentation.\n- There is a free website security audit on logicfast.co.\n- Contact: info@logicfast.co or logicfast.co.\n\n# RULES\n- At the very start you must have said you are an AI assistant. If asked, always confirm you are an AI. Never pretend to be human.\n- Never invent facts, clients, case studies, discounts, guarantees or timelines beyond the list above. Do not promise anything on behalf of the team.\n- If asked something you cannot answer from the list above (for example exact pricing for their case, a technical detail, contracts, or a specific client), do NOT guess. Say exactly: \"Yeh sawal mere paas jawab nahi hai, main isay team ke liye note kar leti hoon, wo aap ko bata denge.\" Then continue the call.\n- The only personal data you may ask for is the name, company and phone number described in \"WHO YOU ARE CALLING\", and only in that situation. Never ask for passwords, CNIC, bank or card details, or an email.\n- If they ask who gave you their number or are upset, apologise briefly and offer to remove them from the list.\n- If you reach voicemail or an answering machine, end the call without leaving a message.\n- If there is no response for several seconds, ask once \"Hello, kya aap mujhe sun pa rahe hain?\" and if there is still silence, end the call politely.\n- Keep the whole call under 3 minutes. Close with a short thank-you (\"Waqt dene ka shukriya, Allah hafiz\") and end the call.",
+                    "time": 1794817525015,
+                    "secondsFromStart": 0
+                  },
+                  {
+                    "role": "bot",
+                    "message": "ہیلو، یہ ایک. اے آئی. کال ہے۔",
+                    "time": 1794817527928,
+                    "endTime": 1794817530208,
+                    "secondsFromStart": 2.64,
+                    "duration": 1380,
+                    "source": "",
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                  },
+                  {
+                    "role": "user",
+                    "message": "جی۔",
+                    "time": 1794817532794,
+                    "endTime": 1794817532854,
+                    "secondsFromStart": 7.506,
+                    "duration": 60,
+                    "metadata": {
+                      "wordLevelConfidence": [
+                        {
+                          "word": "ج",
+                          "start": 7.5,
+                          "end": 7.56,
+                          "confidence": 0.999,
+                          "punctuated_word": "ج",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "ی",
+                          "start": 7.56,
+                          "end": 7.56,
+                          "confidence": 0.999,
+                          "punctuated_word": "ی",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "۔",
+                          "start": 7.56,
+                          "end": 7.56,
+                          "confidence": 0.947,
+                          "punctuated_word": "۔",
+                          "language": "ur"
+                        }
+                      ]
+                    },
+                    "confidence": 0.9816666666666666,
+                    "confidenceSource": "derived"
+                  },
+                  {
+                    "role": "bot",
+                    "message": "السلام علیکم، کیا آپ کے پاس 2 منٹ ہیں؟",
+                    "time": 1794817534408,
+                    "endTime": 1794817537048,
+                    "secondsFromStart": 9.12,
+                    "duration": 2640,
+                    "source": "",
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                  },
+                  {
+                    "role": "user",
+                    "message": "جی۔",
+                    "time": 1794817539394,
+                    "endTime": 1794817539454,
+                    "secondsFromStart": 14.106,
+                    "duration": 60,
+                    "metadata": {
+                      "wordLevelConfidence": [
+                        {
+                          "word": "ج",
+                          "start": 14.1,
+                          "end": 14.16,
+                          "confidence": 0.998,
+                          "punctuated_word": "ج",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "ی",
+                          "start": 14.16,
+                          "end": 14.16,
+                          "confidence": 0.999,
+                          "punctuated_word": "ی",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "۔",
+                          "start": 14.16,
+                          "end": 14.16,
+                          "confidence": 0.994,
+                          "punctuated_word": "۔",
+                          "language": "ur"
+                        }
+                      ]
+                    },
+                    "confidence": 0.9969999999999999,
+                    "confidenceSource": "derived"
+                  },
+                  {
+                    "role": "bot",
+                    "message": "کیا میری بات نیم سے ہو رہی ہے؟",
+                    "time": 1794817540828,
+                    "endTime": 1794817542088,
+                    "secondsFromStart": 15.54,
+                    "duration": 1260,
+                    "source": "",
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                  },
+                  {
+                    "role": "user",
+                    "message": "نہیں۔",
+                    "time": 1794817544554,
+                    "endTime": 1794817544614,
+                    "secondsFromStart": 19.266,
+                    "duration": 60,
+                    "metadata": {
+                      "wordLevelConfidence": [
+                        {
+                          "word": "نہیں",
+                          "start": 19.26,
+                          "end": 19.32,
+                          "confidence": 0.999,
+                          "punctuated_word": "نہیں",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "۔",
+                          "start": 19.32,
+                          "end": 19.32,
+                          "confidence": 0.999,
+                          "punctuated_word": "۔",
+                          "language": "ur"
+                        }
+                      ]
+                    },
+                    "confidence": 0.999,
+                    "confidenceSource": "derived"
+                  },
+                  {
+                    "role": "bot",
+                    "message": "براہِ کرم مجھے صحیح شخص کا نام بتائیں یا بتائیں کہ میں کب کال کر سکتا ہوں۔",
+                    "time": 1794817546048,
+                    "endTime": 1794817549648,
+                    "secondsFromStart": 20.76,
+                    "duration": 3600,
+                    "source": "",
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                  },
+                  {
+                    "role": "user",
+                    "message": "میرا نام سمیر ہے۔",
+                    "time": 1794817552174,
+                    "endTime": 1794817552774,
+                    "secondsFromStart": 26.886,
+                    "duration": 600,
+                    "metadata": {
+                      "wordLevelConfidence": [
+                        {
+                          "word": "می",
+                          "start": 26.88,
+                          "end": 26.94,
+                          "confidence": 0.999,
+                          "punctuated_word": "می",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "را",
+                          "start": 27,
+                          "end": 27.06,
+                          "confidence": 1,
+                          "punctuated_word": "را",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "نام",
+                          "start": 27.12,
+                          "end": 27.18,
+                          "confidence": 1,
+                          "punctuated_word": "نام",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "سم",
+                          "start": 27.42,
+                          "end": 27.48,
+                          "confidence": 0.898,
+                          "punctuated_word": "سم",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "یر",
+                          "start": 27.48,
+                          "end": 27.48,
+                          "confidence": 0.991,
+                          "punctuated_word": "یر",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "ہے۔",
+                          "start": 27.48,
+                          "end": 27.48,
+                          "confidence": 0.997,
+                          "punctuated_word": "ہے۔",
+                          "language": "ur"
+                        }
+                      ]
+                    },
+                    "confidence": 0.9808333333333333,
+                    "confidenceSource": "derived"
+                  },
+                  {
+                    "role": "bot",
+                    "message": "شکریہ سمیر، آپ کس کمپنی یا بزنس سے ہیں؟",
+                    "time": 1794817554508,
+                    "endTime": 1794817556488,
+                    "secondsFromStart": 29.22,
+                    "duration": 1980,
+                    "source": "",
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                  },
+                  {
+                    "role": "user",
+                    "message": "ام، میں گارمنٹس—",
+                    "time": 1794817559854,
+                    "endTime": 1794817560574,
+                    "secondsFromStart": 34.566,
+                    "duration": 720,
+                    "metadata": {
+                      "wordLevelConfidence": [
+                        {
+                          "word": "ام",
+                          "start": 34.56,
+                          "end": 34.62,
+                          "confidence": 0.679,
+                          "punctuated_word": "ام",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "،",
+                          "start": 34.68,
+                          "end": 34.74,
+                          "confidence": 0.935,
+                          "punctuated_word": "،",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "میں",
+                          "start": 34.74,
+                          "end": 34.8,
+                          "confidence": 0.999,
+                          "punctuated_word": "میں",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "گ",
+                          "start": 34.98,
+                          "end": 35.04,
+                          "confidence": 0.989,
+                          "punctuated_word": "گ",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "ار",
+                          "start": 35.1,
+                          "end": 35.16,
+                          "confidence": 0.999,
+                          "punctuated_word": "ار",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "من",
+                          "start": 35.22,
+                          "end": 35.28,
+                          "confidence": 0.985,
+                          "punctuated_word": "من",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "ٹ",
+                          "start": 35.28,
+                          "end": 35.28,
+                          "confidence": 0.999,
+                          "punctuated_word": "ٹ",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "س",
+                          "start": 35.28,
+                          "end": 35.28,
+                          "confidence": 0.999,
+                          "punctuated_word": "س",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "—",
+                          "start": 35.28,
+                          "end": 35.28,
+                          "confidence": 0.653,
+                          "punctuated_word": "—",
+                          "language": "ur"
+                        }
+                      ]
+                    },
+                    "confidence": 0.9152222222222223,
+                    "confidenceSource": "derived"
+                  },
+                  {
+                    "role": "bot",
+                    "message": "شکریہ سمیر، آپ کے بزنس میں کون سے کام بار بار ہاتھ سے کرنے پڑتے ہیں؟ جیسے کہ لیڈز کا فالو اپ، رپورٹس، یا کسٹمر میسجز؟",
+                    "time": 1794817563628,
+                    "endTime": 1794817570048,
+                    "secondsFromStart": 38.34,
+                    "duration": 5940,
+                    "source": "",
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                  },
+                  {
+                    "role": "user",
+                    "message": "میسجز۔",
+                    "time": 1794817572874,
+                    "endTime": 1794817573294,
+                    "secondsFromStart": 47.586,
+                    "duration": 420,
+                    "metadata": {
+                      "wordLevelConfidence": [
+                        {
+                          "word": "می",
+                          "start": 47.58,
+                          "end": 47.64,
+                          "confidence": 0.952,
+                          "punctuated_word": "می",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "س",
+                          "start": 47.76,
+                          "end": 47.82,
+                          "confidence": 0.958,
+                          "punctuated_word": "س",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "ج",
+                          "start": 47.88,
+                          "end": 47.94,
+                          "confidence": 0.995,
+                          "punctuated_word": "ج",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "ز",
+                          "start": 47.94,
+                          "end": 48,
+                          "confidence": 0.826,
+                          "punctuated_word": "ز",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "۔",
+                          "start": 48,
+                          "end": 48,
+                          "confidence": 0.913,
+                          "punctuated_word": "۔",
+                          "language": "ur"
+                        }
+                      ]
+                    },
+                    "confidence": 0.9288000000000001,
+                    "confidenceSource": "derived"
+                  },
+                  {
+                    "role": "bot",
+                    "message": "کیا آپ نے کبھی اے آئی یا آٹومیشن استعمال کرنے کے بارے میں سوچا ہے؟",
+                    "time": 1794817574548,
+                    "endTime": 1794817577728,
+                    "secondsFromStart": 49.26,
+                    "duration": 3180,
+                    "source": "",
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                  },
+                  {
+                    "role": "user",
+                    "message": "جی۔",
+                    "time": 1794817579594,
+                    "endTime": 1794817579654,
+                    "secondsFromStart": 54.306,
+                    "duration": 60,
+                    "metadata": {
+                      "wordLevelConfidence": [
+                        {
+                          "word": "ج",
+                          "start": 54.3,
+                          "end": 54.36,
+                          "confidence": 1,
+                          "punctuated_word": "ج",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "ی",
+                          "start": 54.36,
+                          "end": 54.36,
+                          "confidence": 1,
+                          "punctuated_word": "ی",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "۔",
+                          "start": 54.36,
+                          "end": 54.36,
+                          "confidence": 0.997,
+                          "punctuated_word": "۔",
+                          "language": "ur"
+                        }
+                      ]
+                    },
+                    "confidence": 0.999,
+                    "confidenceSource": "derived"
+                  },
+                  {
+                    "role": "bot",
+                    "message": "اگر لاجک فاسٹ کی ٹیم، جس کو بلال نعیم لیڈ کرتے ہیں، آپ سے اس بارے میں بات کرے تو کیا آپ کو ٹھیک لگے گا؟",
+                    "time": 1794817580788,
+                    "endTime": 1794817586728,
+                    "secondsFromStart": 55.5,
+                    "duration": 5940,
+                    "source": "",
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                  },
+                  {
+                    "role": "user",
+                    "message": "جی۔",
+                    "time": 1794817588594,
+                    "endTime": 1794817588654,
+                    "secondsFromStart": 63.306,
+                    "duration": 60,
+                    "metadata": {
+                      "wordLevelConfidence": [
+                        {
+                          "word": "ج",
+                          "start": 63.3,
+                          "end": 63.36,
+                          "confidence": 1,
+                          "punctuated_word": "ج",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "ی",
+                          "start": 63.36,
+                          "end": 63.36,
+                          "confidence": 0.979,
+                          "punctuated_word": "ی",
+                          "language": "ur"
+                        },
+                        {
+                          "word": "۔",
+                          "start": 63.36,
+                          "end": 63.36,
+                          "confidence": 0.995,
+                          "punctuated_word": "۔",
+                          "language": "ur"
+                        }
+                      ]
+                    },
+                    "confidence": 0.9913333333333334,
+                    "confidenceSource": "derived"
+                  },
+                  {
+                    "role": "bot",
+                    "message": "ہماری ٹیم آپ سے جلد رابطہ کرے گی۔ آپ کا وقت دینے کا شکریہ، اللہ حافظ۔",
+                    "time": 1794817589848,
+                    "endTime": 1794817594408,
+                    "secondsFromStart": 64.56,
+                    "duration": 3900,
+                    "source": "",
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                  }
+                ],
+                "messagesOpenAIFormatted": [
+                  {
+                    "role": "system",
+                    "content": "# FIRST MESSAGE (paste into the \"First Message\" field)\n\nAssalam-o-Alaikum! Main Logic Fast ka AI assistant hoon. Kya aap ke paas do minute hain?\n\n---\n\n# SYSTEM PROMPT (paste into the \"System Prompt\" field)\n\n# ROLE\nYou are the AI voice assistant of Logic Fast (spelled LogicFast in writing), a founder-led team in Gujranwala, Pakistan that builds websites, web apps, mobile apps and AI automations for businesses. You are making a short call to find out in 2 minutes or less whether Logic Fast's AI automation could help the person, and to note their interest. You are NOT here to sell hard or close a deal.\n\n# WHO YOU ARE CALLING\nDetails supplied for this call: name = {{name}}, company = {{company}}.\n- If a value is empty, missing, or still shows as a placeholder in curly braces, treat it as UNKNOWN. Never read a placeholder aloud.\n- NAME KNOWN: after they say they have two minutes, confirm once: \"Kya meri baat {{name}} se ho rahi hai?\" If they say no, ask politely for the right person or offer a callback.\n- NAME UNKNOWN: ask once: \"Aap ka naam kya hai?\" Then use their name naturally. Because the details are unknown, also ask for their company: \"Aap kis company ya business se hain?\"\n- If the name was unknown AND the person is interested or wants a callback, ask once before closing: \"Hamari team aap se rabta karne ke liye aap ka number kya hoga?\" Repeat the number back digit by digit to confirm.\n- If the name was known, do NOT ask for a phone number or any other personal data.\n\n# LANGUAGE AND STYLE\n- Speak in the same language the person uses: Urdu, Roman-Urdu style Hindi-Urdu, or English. Default to simple Urdu mixed with common English words.\n- Use gender-neutral phrasing for yourself (\"main Logic Fast ka AI assistant hoon\").\n- Say the company name as two words, \"Logic Fast\", clearly.\n- Sound warm, calm and respectful. Use \"aap\" always.\n- Keep every turn to 1-2 short sentences. Ask only ONE question at a time, then wait.\n- Never read lists aloud. Never use bullet points, markdown or emojis.\n\n# CALL FLOW\n1. OPENING (already spoken as the first message). If the person says it is the wrong person or a bad time, go to \"Callback\".\n2. If they have two minutes, handle \"WHO YOU ARE CALLING\" above (confirm the name, or ask for it).\n3. Ask these three questions, one at a time, reacting briefly to each answer:\n   a. \"Aap ke business mein kaun se kaam baar baar haath se karne parte hain, jaise leads follow-up, reports, ya customer messages?\"\n   b. \"Kya aap ne kabhi AI ya automation use karne ke baare mein socha hai?\"\n   c. \"Agar Logic Fast ki team, jis ko Bilal Naeem lead karte hain, aap se is baare mein baat kare, to kya aap ko theek lagega?\"\n4. If interested: (if details were unknown, collect the number as described above), thank them, say the team will contact them, and end the call.\n5. If not interested: thank them politely and end the call. Do not argue or try to change their mind more than once.\n\n# CALLBACK\nIf they are busy or ask to be called later, ask: \"Theek hai, aap kis din aur kis waqt call karna pasand karenge?\" Repeat the day and time back to confirm, thank them, and end the call. (If the name was unknown, also get their name and number as described above.)\n\n# OPT-OUT (HIGHEST PRIORITY)\nIf the person says anything like \"dobara call mat karo\", \"mujhe call na karein\", \"remove my number\", \"stop calling\" or \"do not call again\", in any language, stop immediately. Say once: \"Maazrat, main aap ka number abhi list se hata deti hoon, aap ko dobara call nahi aayegi. Shukriya, Allah hafiz.\" Then end the call. Do not ask why, and do not try to persuade them.\nA request like \"abhi nahi, kal call karna\" is a CALLBACK, not an opt-out.\n\n# WHAT YOU MAY SAY ABOUT LOGICFAST (only this, nothing more)\n- Logic Fast is a founder-led team in Gujranwala serving businesses across Pakistan. The founder, Bilal Naeem, personally leads every project.\n- Services: web development, AI automation, mobile apps, digital marketing, local SEO and Google Business Profile, website care and maintenance, and website security audits.\n- AI automation means practical automations that remove repetitive work, such as connecting workflows, processing documents, sorting enquiries, drafting routine messages and generating reports. Every automation includes human review checkpoints. If a task is not a good fit, they will say so honestly.\n- The price is always fixed and agreed in writing before work starts, with no hidden charges. A typical AI workflow automation is around PKR 50,000 to 150,000 and takes 2 to 4 weeks. The final quote depends on the scope.\n- The client owns the code, content, accounts and documentation.\n- There is a free website security audit on logicfast.co.\n- Contact: info@logicfast.co or logicfast.co.\n\n# RULES\n- At the very start you must have said you are an AI assistant. If asked, always confirm you are an AI. Never pretend to be human.\n- Never invent facts, clients, case studies, discounts, guarantees or timelines beyond the list above. Do not promise anything on behalf of the team.\n- If asked something you cannot answer from the list above (for example exact pricing for their case, a technical detail, contracts, or a specific client), do NOT guess. Say exactly: \"Yeh sawal mere paas jawab nahi hai, main isay team ke liye note kar leti hoon, wo aap ko bata denge.\" Then continue the call.\n- The only personal data you may ask for is the name, company and phone number described in \"WHO YOU ARE CALLING\", and only in that situation. Never ask for passwords, CNIC, bank or card details, or an email.\n- If they ask who gave you their number or are upset, apologise briefly and offer to remove them from the list.\n- If you reach voicemail or an answering machine, end the call without leaving a message.\n- If there is no response for several seconds, ask once \"Hello, kya aap mujhe sun pa rahe hain?\" and if there is still silence, end the call politely.\n- Keep the whole call under 3 minutes. Close with a short thank-you (\"Waqt dene ka shukriya, Allah hafiz\") and end the call."
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "ہیلو، یہ ایک. اے آئی. کال ہے۔"
+                  },
+                  {
+                    "role": "user",
+                    "content": "جی۔"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "السلام علیکم، کیا آپ کے پاس 2 منٹ ہیں؟"
+                  },
+                  {
+                    "role": "user",
+                    "content": "جی۔"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "کیا میری بات نیم سے ہو رہی ہے؟"
+                  },
+                  {
+                    "role": "user",
+                    "content": "نہیں۔"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "براہِ کرم مجھے صحیح شخص کا نام بتائیں یا بتائیں کہ میں کب کال کر سکتا ہوں۔"
+                  },
+                  {
+                    "role": "user",
+                    "content": "میرا نام سمیر ہے۔"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "شکریہ سمیر، آپ کس کمپنی یا بزنس سے ہیں؟"
+                  },
+                  {
+                    "role": "user",
+                    "content": "ام، میں گارمنٹس—"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "شکریہ سمیر، آپ کے بزنس میں کون سے کام بار بار ہاتھ سے کرنے پڑتے ہیں؟ جیسے کہ لیڈز کا فالو اپ، رپورٹس، یا کسٹمر میسجز؟"
+                  },
+                  {
+                    "role": "user",
+                    "content": "میسجز۔"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "کیا آپ نے کبھی اے آئی یا آٹومیشن استعمال کرنے کے بارے میں سوچا ہے؟"
+                  },
+                  {
+                    "role": "user",
+                    "content": "جی۔"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "اگر لاجک فاسٹ کی ٹیم، جس کو بلال نعیم لیڈ کرتے ہیں، آپ سے اس بارے میں بات کرے تو کیا آپ کو ٹھیک لگے گا؟"
+                  },
+                  {
+                    "role": "user",
+                    "content": "جی۔"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "ہماری ٹیم آپ سے جلد رابطہ کرے گی۔ آپ کا وقت دینے کا شکریہ، اللہ حافظ۔"
+                  }
+                ],
+                "transcript": "AI: ہیلو، یہ ایک. اے آئی. کال ہے۔\nUser: جی۔\nAI: السلام علیکم، کیا آپ کے پاس 2 منٹ ہیں؟\nUser: جی۔\nAI: کیا میری بات نیم سے ہو رہی ہے؟\nUser: نہیں۔\nAI: براہِ کرم مجھے صحیح شخص کا نام بتائیں یا بتائیں کہ میں کب کال کر سکتا ہوں۔\nUser: میرا نام سمیر ہے۔\nAI: شکریہ سمیر، آپ کس کمپنی یا بزنس سے ہیں؟\nUser: ام، میں گارمنٹس—\nAI: شکریہ سمیر، آپ کے بزنس میں کون سے کام بار بار ہاتھ سے کرنے پڑتے ہیں؟ جیسے کہ لیڈز کا فالو اپ، رپورٹس، یا کسٹمر میسجز؟\nUser: میسجز۔\nAI: کیا آپ نے کبھی اے آئی یا آٹومیشن استعمال کرنے کے بارے میں سوچا ہے؟\nUser: جی۔\nAI: اگر لاجک فاسٹ کی ٹیم، جس کو بلال نعیم لیڈ کرتے ہیں، آپ سے اس بارے میں بات کرے تو کیا آپ کو ٹھیک لگے گا؟\nUser: جی۔\nAI: ہماری ٹیم آپ سے جلد رابطہ کرے گی۔ آپ کا وقت دینے کا شکریہ، اللہ حافظ۔\n",
+                "recordingUrl": "https://94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/hipaa-recordings/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-1715d004-8b14-4ca4-99e8-e7a341fed3f6-mono.wav",
+                "stereoRecordingUrl": "https://94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/hipaa-recordings/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-860f73d0-36c3-4b19-8792-cc877d28483b-stereo.wav",
+                "logUrl": "https://94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/hipaa-calllogs/77faf4a1-931d-4df1-bcd0-25cd4e2b1624/01a1e376-048d-766a-a6a5-f4589f30fc3b-1f2a7edf-c873-4551-a06d-dbee5ddd8b78-1794817607880.jsonl.gz",
+                "recording": {
+                  "stereoUrl": "https://94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/hipaa-recordings/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-860f73d0-36c3-4b19-8792-cc877d28483b-stereo.wav",
+                  "mono": {
+                    "combinedUrl": "https://94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/hipaa-recordings/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-1715d004-8b14-4ca4-99e8-e7a341fed3f6-mono.wav",
+                    "assistantUrl": "https://94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/hipaa-recordings/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-c69dc419-d7b8-426b-81cc-4657f3e3d4a4-mono.wav",
+                    "customerUrl": "https://94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/hipaa-recordings/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-c0637189-a3ae-4445-b485-a47648c84d47-mono.wav"
+                  }
+                },
+                "nodes": [],
+                "assistantActivations": [
+                  {
+                    "assistantName": "Dummy Assistant for task",
+                    "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98",
+                    "assistantVersion": "v9"
+                  }
+                ],
+                "variables": {
+                  "now": "Nov 16, 2026, 8:25 AM UTC",
+                  "currentDateTime": "Monday, November 16, 2026 at 8:25 AM UTC",
+                  "date": "Nov 16, 2026 UTC",
+                  "time": "8:25 AM UTC",
+                  "year": "2026",
+                  "month": "November",
+                  "day": "16",
+                  "transport": {
+                    "conversationType": "voice",
+                    "provider": "daily",
+                    "videoRecordingEnabled": false,
+                    "assistantVideoEnabled": false,
+                    "roomDeleteOnUserLeaveEnabled": true,
+                    "callUrl": "https://vapi.daily.co/eQMYL2nNsZzL6JeybzM0"
+                  },
+                  "call": {
+                    "id": "01a1e376-048d-766a-a6a5-f4589f30fc3b",
+                    "type": "webCall",
+                    "status": "queued",
+                    "createdAt": "2026-11-16T08:25:24.877Z",
+                    "transport": {
+                      "conversationType": "voice",
+                      "provider": "daily",
+                      "videoRecordingEnabled": false,
+                      "assistantVideoEnabled": false,
+                      "roomDeleteOnUserLeaveEnabled": true,
+                      "callUrl": "https://vapi.daily.co/eQMYL2nNsZzL6JeybzM0"
+                    }
+                  }
+                },
+                "variableValues": {
+                  "now": "Nov 16, 2026, 8:25 AM UTC",
+                  "currentDateTime": "Monday, November 16, 2026 at 8:25 AM UTC",
+                  "date": "Nov 16, 2026 UTC",
+                  "time": "8:25 AM UTC",
+                  "year": "2026",
+                  "month": "November",
+                  "day": "16",
+                  "transport": {
+                    "conversationType": "voice",
+                    "provider": "daily",
+                    "videoRecordingEnabled": false,
+                    "assistantVideoEnabled": false,
+                    "roomDeleteOnUserLeaveEnabled": true,
+                    "callUrl": "https://vapi.daily.co/eQMYL2nNsZzL6JeybzM0"
+                  },
+                  "call": {
+                    "id": "01a1e376-048d-766a-a6a5-f4589f30fc3b",
+                    "type": "webCall",
+                    "status": "queued",
+                    "createdAt": "2026-11-16T08:25:24.877Z",
+                    "transport": {
+                      "conversationType": "voice",
+                      "provider": "daily",
+                      "videoRecordingEnabled": false,
+                      "assistantVideoEnabled": false,
+                      "roomDeleteOnUserLeaveEnabled": true,
+                      "callUrl": "https://vapi.daily.co/eQMYL2nNsZzL6JeybzM0"
+                    }
+                  }
+                },
+                "performanceMetrics": {
+                  "turnLatencies": [
+                    {
+                      "modelLatency": 511,
+                      "voiceLatency": 309,
+                      "transcriberLatency": 391,
+                      "endpointingLatency": 3,
+                      "turnLatency": 1218
+                    },
+                    {
+                      "modelLatency": 433,
+                      "voiceLatency": 319,
+                      "transcriberLatency": 274,
+                      "endpointingLatency": 2,
+                      "turnLatency": 1055
+                    },
+                    {
+                      "modelLatency": 495,
+                      "voiceLatency": 295,
+                      "transcriberLatency": 5427,
+                      "endpointingLatency": 2,
+                      "turnLatency": 6220,
+                      "unmeasured": [
+                        "transcriber"
+                      ]
+                    },
+                    {
+                      "modelLatency": 683,
+                      "voiceLatency": 280,
+                      "transcriberLatency": 229,
+                      "endpointingLatency": 3,
+                      "turnLatency": 1220
+                    },
+                    {
+                      "modelLatency": 1375,
+                      "voiceLatency": 461,
+                      "transcriberLatency": 662,
+                      "endpointingLatency": 363,
+                      "turnLatency": 2911,
+                      "unmeasured": [
+                        "transcriber"
+                      ]
+                    },
+                    {
+                      "modelLatency": 429,
+                      "voiceLatency": 255,
+                      "transcriberLatency": 405,
+                      "endpointingLatency": 3,
+                      "turnLatency": 1126
+                    },
+                    {
+                      "modelLatency": 451,
+                      "voiceLatency": 259,
+                      "transcriberLatency": 229,
+                      "endpointingLatency": 3,
+                      "turnLatency": 968
+                    },
+                    {
+                      "modelLatency": 390,
+                      "voiceLatency": 296,
+                      "transcriberLatency": 232,
+                      "endpointingLatency": 3,
+                      "turnLatency": 944
+                    }
+                  ],
+                  "modelLatencyAverage": 595.88,
+                  "voiceLatencyAverage": 309.25,
+                  "transcriberLatencyAverage": 981.13,
+                  "endpointingLatencyAverage": 47.75,
+                  "turnLatencyAverage": 1957.75,
+                  "turnLatencyUnmeasuredTracked": true,
+                  "fromTransportLatencyAverage": 20,
+                  "toTransportLatencyAverage": 48
+                },
+                "scorecards": {},
+                "transfers": [],
+                "presignedLogUrl": "https://hipaa-calllogs.94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/77faf4a1-931d-4df1-bcd0-25cd4e2b1624/01a1e376-048d-766a-a6a5-f4589f30fc3b-1f2a7edf-c873-4551-a06d-dbee5ddd8b78-1794817607880.jsonl.gz?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=df07c1e5b01dd833342a7afeebb72e89%2F20261116%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261116T082648Z&X-Amz-Expires=1800&X-Amz-Signature=e340adc9b39221e00c10c321441f3e19911cf3020e0fea83423bcf06f8159fd1&X-Amz-SignedHeaders=host&x-id=GetObject",
+                "presignedMonoUrl": "https://hipaa-recordings.94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-1715d004-8b14-4ca4-99e8-e7a341fed3f6-mono.wav?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=df07c1e5b01dd833342a7afeebb72e89%2F20261116%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261116T082648Z&X-Amz-Expires=1800&X-Amz-Signature=a3600be0571de3d0aac2d1bcf7ec1601f5f16cc2535c7e11ced389fc1329a325&X-Amz-SignedHeaders=host&x-id=GetObject",
+                "presignedStereoUrl": "https://hipaa-recordings.94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-860f73d0-36c3-4b19-8792-cc877d28483b-stereo.wav?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=df07c1e5b01dd833342a7afeebb72e89%2F20261116%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261116T082648Z&X-Amz-Expires=1800&X-Amz-Signature=1fd00083f43706446dd31e19ac04e706ae76f05cc261fa6fb926daf8492828e2&X-Amz-SignedHeaders=host&x-id=GetObject",
+                "presignedAssistantUrl": "https://hipaa-recordings.94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-c69dc419-d7b8-426b-81cc-4657f3e3d4a4-mono.wav?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=df07c1e5b01dd833342a7afeebb72e89%2F20261116%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261116T082648Z&X-Amz-Expires=1800&X-Amz-Signature=f319b9ef36bf3b7489cddc5121f57583fefad93b3bb7841fd9cca1061a8a79ca&X-Amz-SignedHeaders=host&x-id=GetObject",
+                "presignedCustomerUrl": "https://hipaa-recordings.94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-c0637189-a3ae-4445-b485-a47648c84d47-mono.wav?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=df07c1e5b01dd833342a7afeebb72e89%2F20261116%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261116T082648Z&X-Amz-Expires=1800&X-Amz-Signature=c796f5951a86681b9e694027c31b0e504cadb19255b43e5b38eec26e07c10c8f&X-Amz-SignedHeaders=host&x-id=GetObject",
+                "presignedUrlsExpiresAt": "2026-11-16T08:56:48.392Z"
+              },
+              "startedAt": "2026-11-16T08:25:25.288Z",
+              "endedAt": "2026-11-16T08:26:44.493Z",
+              "endedReason": "customer-ended-call",
+              "cost": 0.0818,
+              "costBreakdown": {
+                "stt": 0.0054,
+                "llm": 0.002,
+                "tts": 0.0083,
+                "vapi": 0.066,
+                "chat": 0,
+                "transport": 0,
+                "total": 0.0818,
+                "llmPromptTokens": 12886,
+                "llmCompletionTokens": 187,
+                "llmCachedPromptTokens": 5760,
+                "ttsCharacters": 553,
+                "voicemailDetectionCost": 0,
+                "knowledgeBaseCost": 0,
+                "analysisCostBreakdown": {
+                  "summary": 0,
+                  "summaryPromptTokens": 0,
+                  "summaryCompletionTokens": 0,
+                  "summaryCachedPromptTokens": 0,
+                  "structuredData": 0,
+                  "structuredDataPromptTokens": 0,
+                  "structuredDataCompletionTokens": 0,
+                  "structuredDataCachedPromptTokens": 0,
+                  "successEvaluation": 0,
+                  "successEvaluationPromptTokens": 0,
+                  "successEvaluationCompletionTokens": 0,
+                  "successEvaluationCachedPromptTokens": 0,
+                  "structuredOutput": 0,
+                  "structuredOutputPromptTokens": 0,
+                  "structuredOutputCompletionTokens": 0,
+                  "structuredOutputCachedPromptTokens": 0
+                }
+              },
+              "costs": [
+                {
+                  "type": "transcriber",
+                  "transcriber": {
+                    "provider": "soniox",
+                    "model": "stt-rt-v5"
+                  },
+                  "minutes": 1.2095166666666666,
+                  "cost": 0.0054471
+                },
+                {
+                  "type": "model",
+                  "model": {
+                    "provider": "openai",
+                    "model": "gpt-4o-mini"
+                  },
+                  "promptTokens": 12886,
+                  "completionTokens": 187,
+                  "cachedPromptTokens": 5760,
+                  "reasoningTokens": 0,
+                  "cost": 0.0020451
+                },
+                {
+                  "type": "voice",
+                  "voice": {
+                    "provider": "vapi",
+                    "voiceId": "Elliot",
+                    "model": "vapi-v2"
+                  },
+                  "characters": 553,
+                  "cost": 0.008295
+                },
+                {
+                  "type": "vapi",
+                  "subType": "normal",
+                  "minutes": 1.3201,
+                  "cost": 0.066005
+                },
+                {
+                  "type": "knowledge-base",
+                  "model": {
+                    "provider": "google",
+                    "model": "gemini-3.1-flash-lite"
+                  },
+                  "promptTokens": 0,
+                  "completionTokens": 0,
+                  "cost": 0
+                }
+              ],
+              "durationMs": 79205,
+              "durationSeconds": 79.205,
+              "durationMinutes": 1.3201,
+              "summary": "",
+              "transcript": "AI: ہیلو، یہ ایک. اے آئی. کال ہے۔\nUser: جی۔\nAI: السلام علیکم، کیا آپ کے پاس 2 منٹ ہیں؟\nUser: جی۔\nAI: کیا میری بات نیم سے ہو رہی ہے؟\nUser: نہیں۔\nAI: براہِ کرم مجھے صحیح شخص کا نام بتائیں یا بتائیں کہ میں کب کال کر سکتا ہوں۔\nUser: میرا نام سمیر ہے۔\nAI: شکریہ سمیر، آپ کس کمپنی یا بزنس سے ہیں؟\nUser: ام، میں گارمنٹس—\nAI: شکریہ سمیر، آپ کے بزنس میں کون سے کام بار بار ہاتھ سے کرنے پڑتے ہیں؟ جیسے کہ لیڈز کا فالو اپ، رپورٹس، یا کسٹمر میسجز؟\nUser: میسجز۔\nAI: کیا آپ نے کبھی اے آئی یا آٹومیشن استعمال کرنے کے بارے میں سوچا ہے؟\nUser: جی۔\nAI: اگر لاجک فاسٹ کی ٹیم، جس کو بلال نعیم لیڈ کرتے ہیں، آپ سے اس بارے میں بات کرے تو کیا آپ کو ٹھیک لگے گا؟\nUser: جی۔\nAI: ہماری ٹیم آپ سے جلد رابطہ کرے گی۔ آپ کا وقت دینے کا شکریہ، اللہ حافظ۔\n",
+              "messages": [
+                {
+                  "role": "system",
+                  "message": "# FIRST MESSAGE (paste into the \"First Message\" field)\n\nAssalam-o-Alaikum! Main Logic Fast ka AI assistant hoon. Kya aap ke paas do minute hain?\n\n---\n\n# SYSTEM PROMPT (paste into the \"System Prompt\" field)\n\n# ROLE\nYou are the AI voice assistant of Logic Fast (spelled LogicFast in writing), a founder-led team in Gujranwala, Pakistan that builds websites, web apps, mobile apps and AI automations for businesses. You are making a short call to find out in 2 minutes or less whether Logic Fast's AI automation could help the person, and to note their interest. You are NOT here to sell hard or close a deal.\n\n# WHO YOU ARE CALLING\nDetails supplied for this call: name = {{name}}, company = {{company}}.\n- If a value is empty, missing, or still shows as a placeholder in curly braces, treat it as UNKNOWN. Never read a placeholder aloud.\n- NAME KNOWN: after they say they have two minutes, confirm once: \"Kya meri baat {{name}} se ho rahi hai?\" If they say no, ask politely for the right person or offer a callback.\n- NAME UNKNOWN: ask once: \"Aap ka naam kya hai?\" Then use their name naturally. Because the details are unknown, also ask for their company: \"Aap kis company ya business se hain?\"\n- If the name was unknown AND the person is interested or wants a callback, ask once before closing: \"Hamari team aap se rabta karne ke liye aap ka number kya hoga?\" Repeat the number back digit by digit to confirm.\n- If the name was known, do NOT ask for a phone number or any other personal data.\n\n# LANGUAGE AND STYLE\n- Speak in the same language the person uses: Urdu, Roman-Urdu style Hindi-Urdu, or English. Default to simple Urdu mixed with common English words.\n- Use gender-neutral phrasing for yourself (\"main Logic Fast ka AI assistant hoon\").\n- Say the company name as two words, \"Logic Fast\", clearly.\n- Sound warm, calm and respectful. Use \"aap\" always.\n- Keep every turn to 1-2 short sentences. Ask only ONE question at a time, then wait.\n- Never read lists aloud. Never use bullet points, markdown or emojis.\n\n# CALL FLOW\n1. OPENING (already spoken as the first message). If the person says it is the wrong person or a bad time, go to \"Callback\".\n2. If they have two minutes, handle \"WHO YOU ARE CALLING\" above (confirm the name, or ask for it).\n3. Ask these three questions, one at a time, reacting briefly to each answer:\n   a. \"Aap ke business mein kaun se kaam baar baar haath se karne parte hain, jaise leads follow-up, reports, ya customer messages?\"\n   b. \"Kya aap ne kabhi AI ya automation use karne ke baare mein socha hai?\"\n   c. \"Agar Logic Fast ki team, jis ko Bilal Naeem lead karte hain, aap se is baare mein baat kare, to kya aap ko theek lagega?\"\n4. If interested: (if details were unknown, collect the number as described above), thank them, say the team will contact them, and end the call.\n5. If not interested: thank them politely and end the call. Do not argue or try to change their mind more than once.\n\n# CALLBACK\nIf they are busy or ask to be called later, ask: \"Theek hai, aap kis din aur kis waqt call karna pasand karenge?\" Repeat the day and time back to confirm, thank them, and end the call. (If the name was unknown, also get their name and number as described above.)\n\n# OPT-OUT (HIGHEST PRIORITY)\nIf the person says anything like \"dobara call mat karo\", \"mujhe call na karein\", \"remove my number\", \"stop calling\" or \"do not call again\", in any language, stop immediately. Say once: \"Maazrat, main aap ka number abhi list se hata deti hoon, aap ko dobara call nahi aayegi. Shukriya, Allah hafiz.\" Then end the call. Do not ask why, and do not try to persuade them.\nA request like \"abhi nahi, kal call karna\" is a CALLBACK, not an opt-out.\n\n# WHAT YOU MAY SAY ABOUT LOGICFAST (only this, nothing more)\n- Logic Fast is a founder-led team in Gujranwala serving businesses across Pakistan. The founder, Bilal Naeem, personally leads every project.\n- Services: web development, AI automation, mobile apps, digital marketing, local SEO and Google Business Profile, website care and maintenance, and website security audits.\n- AI automation means practical automations that remove repetitive work, such as connecting workflows, processing documents, sorting enquiries, drafting routine messages and generating reports. Every automation includes human review checkpoints. If a task is not a good fit, they will say so honestly.\n- The price is always fixed and agreed in writing before work starts, with no hidden charges. A typical AI workflow automation is around PKR 50,000 to 150,000 and takes 2 to 4 weeks. The final quote depends on the scope.\n- The client owns the code, content, accounts and documentation.\n- There is a free website security audit on logicfast.co.\n- Contact: info@logicfast.co or logicfast.co.\n\n# RULES\n- At the very start you must have said you are an AI assistant. If asked, always confirm you are an AI. Never pretend to be human.\n- Never invent facts, clients, case studies, discounts, guarantees or timelines beyond the list above. Do not promise anything on behalf of the team.\n- If asked something you cannot answer from the list above (for example exact pricing for their case, a technical detail, contracts, or a specific client), do NOT guess. Say exactly: \"Yeh sawal mere paas jawab nahi hai, main isay team ke liye note kar leti hoon, wo aap ko bata denge.\" Then continue the call.\n- The only personal data you may ask for is the name, company and phone number described in \"WHO YOU ARE CALLING\", and only in that situation. Never ask for passwords, CNIC, bank or card details, or an email.\n- If they ask who gave you their number or are upset, apologise briefly and offer to remove them from the list.\n- If you reach voicemail or an answering machine, end the call without leaving a message.\n- If there is no response for several seconds, ask once \"Hello, kya aap mujhe sun pa rahe hain?\" and if there is still silence, end the call politely.\n- Keep the whole call under 3 minutes. Close with a short thank-you (\"Waqt dene ka shukriya, Allah hafiz\") and end the call.",
+                  "time": 1794817525015,
+                  "secondsFromStart": 0
+                },
+                {
+                  "role": "bot",
+                  "message": "ہیلو، یہ ایک. اے آئی. کال ہے۔",
+                  "time": 1794817527928,
+                  "endTime": 1794817530208,
+                  "secondsFromStart": 2.64,
+                  "duration": 1380,
+                  "source": "",
+                  "assistantName": "Dummy Assistant for task",
+                  "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                },
+                {
+                  "role": "user",
+                  "message": "جی۔",
+                  "time": 1794817532794,
+                  "endTime": 1794817532854,
+                  "secondsFromStart": 7.506,
+                  "duration": 60,
+                  "metadata": {
+                    "wordLevelConfidence": [
+                      {
+                        "word": "ج",
+                        "start": 7.5,
+                        "end": 7.56,
+                        "confidence": 0.999,
+                        "punctuated_word": "ج",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "ی",
+                        "start": 7.56,
+                        "end": 7.56,
+                        "confidence": 0.999,
+                        "punctuated_word": "ی",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "۔",
+                        "start": 7.56,
+                        "end": 7.56,
+                        "confidence": 0.947,
+                        "punctuated_word": "۔",
+                        "language": "ur"
+                      }
+                    ]
+                  },
+                  "confidence": 0.9816666666666666,
+                  "confidenceSource": "derived"
+                },
+                {
+                  "role": "bot",
+                  "message": "السلام علیکم، کیا آپ کے پاس 2 منٹ ہیں؟",
+                  "time": 1794817534408,
+                  "endTime": 1794817537048,
+                  "secondsFromStart": 9.12,
+                  "duration": 2640,
+                  "source": "",
+                  "assistantName": "Dummy Assistant for task",
+                  "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                },
+                {
+                  "role": "user",
+                  "message": "جی۔",
+                  "time": 1794817539394,
+                  "endTime": 1794817539454,
+                  "secondsFromStart": 14.106,
+                  "duration": 60,
+                  "metadata": {
+                    "wordLevelConfidence": [
+                      {
+                        "word": "ج",
+                        "start": 14.1,
+                        "end": 14.16,
+                        "confidence": 0.998,
+                        "punctuated_word": "ج",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "ی",
+                        "start": 14.16,
+                        "end": 14.16,
+                        "confidence": 0.999,
+                        "punctuated_word": "ی",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "۔",
+                        "start": 14.16,
+                        "end": 14.16,
+                        "confidence": 0.994,
+                        "punctuated_word": "۔",
+                        "language": "ur"
+                      }
+                    ]
+                  },
+                  "confidence": 0.9969999999999999,
+                  "confidenceSource": "derived"
+                },
+                {
+                  "role": "bot",
+                  "message": "کیا میری بات نیم سے ہو رہی ہے؟",
+                  "time": 1794817540828,
+                  "endTime": 1794817542088,
+                  "secondsFromStart": 15.54,
+                  "duration": 1260,
+                  "source": "",
+                  "assistantName": "Dummy Assistant for task",
+                  "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                },
+                {
+                  "role": "user",
+                  "message": "نہیں۔",
+                  "time": 1794817544554,
+                  "endTime": 1794817544614,
+                  "secondsFromStart": 19.266,
+                  "duration": 60,
+                  "metadata": {
+                    "wordLevelConfidence": [
+                      {
+                        "word": "نہیں",
+                        "start": 19.26,
+                        "end": 19.32,
+                        "confidence": 0.999,
+                        "punctuated_word": "نہیں",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "۔",
+                        "start": 19.32,
+                        "end": 19.32,
+                        "confidence": 0.999,
+                        "punctuated_word": "۔",
+                        "language": "ur"
+                      }
+                    ]
+                  },
+                  "confidence": 0.999,
+                  "confidenceSource": "derived"
+                },
+                {
+                  "role": "bot",
+                  "message": "براہِ کرم مجھے صحیح شخص کا نام بتائیں یا بتائیں کہ میں کب کال کر سکتا ہوں۔",
+                  "time": 1794817546048,
+                  "endTime": 1794817549648,
+                  "secondsFromStart": 20.76,
+                  "duration": 3600,
+                  "source": "",
+                  "assistantName": "Dummy Assistant for task",
+                  "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                },
+                {
+                  "role": "user",
+                  "message": "میرا نام سمیر ہے۔",
+                  "time": 1794817552174,
+                  "endTime": 1794817552774,
+                  "secondsFromStart": 26.886,
+                  "duration": 600,
+                  "metadata": {
+                    "wordLevelConfidence": [
+                      {
+                        "word": "می",
+                        "start": 26.88,
+                        "end": 26.94,
+                        "confidence": 0.999,
+                        "punctuated_word": "می",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "را",
+                        "start": 27,
+                        "end": 27.06,
+                        "confidence": 1,
+                        "punctuated_word": "را",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "نام",
+                        "start": 27.12,
+                        "end": 27.18,
+                        "confidence": 1,
+                        "punctuated_word": "نام",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "سم",
+                        "start": 27.42,
+                        "end": 27.48,
+                        "confidence": 0.898,
+                        "punctuated_word": "سم",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "یر",
+                        "start": 27.48,
+                        "end": 27.48,
+                        "confidence": 0.991,
+                        "punctuated_word": "یر",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "ہے۔",
+                        "start": 27.48,
+                        "end": 27.48,
+                        "confidence": 0.997,
+                        "punctuated_word": "ہے۔",
+                        "language": "ur"
+                      }
+                    ]
+                  },
+                  "confidence": 0.9808333333333333,
+                  "confidenceSource": "derived"
+                },
+                {
+                  "role": "bot",
+                  "message": "شکریہ سمیر، آپ کس کمپنی یا بزنس سے ہیں؟",
+                  "time": 1794817554508,
+                  "endTime": 1794817556488,
+                  "secondsFromStart": 29.22,
+                  "duration": 1980,
+                  "source": "",
+                  "assistantName": "Dummy Assistant for task",
+                  "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                },
+                {
+                  "role": "user",
+                  "message": "ام، میں گارمنٹس—",
+                  "time": 1794817559854,
+                  "endTime": 1794817560574,
+                  "secondsFromStart": 34.566,
+                  "duration": 720,
+                  "metadata": {
+                    "wordLevelConfidence": [
+                      {
+                        "word": "ام",
+                        "start": 34.56,
+                        "end": 34.62,
+                        "confidence": 0.679,
+                        "punctuated_word": "ام",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "،",
+                        "start": 34.68,
+                        "end": 34.74,
+                        "confidence": 0.935,
+                        "punctuated_word": "،",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "میں",
+                        "start": 34.74,
+                        "end": 34.8,
+                        "confidence": 0.999,
+                        "punctuated_word": "میں",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "گ",
+                        "start": 34.98,
+                        "end": 35.04,
+                        "confidence": 0.989,
+                        "punctuated_word": "گ",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "ار",
+                        "start": 35.1,
+                        "end": 35.16,
+                        "confidence": 0.999,
+                        "punctuated_word": "ار",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "من",
+                        "start": 35.22,
+                        "end": 35.28,
+                        "confidence": 0.985,
+                        "punctuated_word": "من",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "ٹ",
+                        "start": 35.28,
+                        "end": 35.28,
+                        "confidence": 0.999,
+                        "punctuated_word": "ٹ",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "س",
+                        "start": 35.28,
+                        "end": 35.28,
+                        "confidence": 0.999,
+                        "punctuated_word": "س",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "—",
+                        "start": 35.28,
+                        "end": 35.28,
+                        "confidence": 0.653,
+                        "punctuated_word": "—",
+                        "language": "ur"
+                      }
+                    ]
+                  },
+                  "confidence": 0.9152222222222223,
+                  "confidenceSource": "derived"
+                },
+                {
+                  "role": "bot",
+                  "message": "شکریہ سمیر، آپ کے بزنس میں کون سے کام بار بار ہاتھ سے کرنے پڑتے ہیں؟ جیسے کہ لیڈز کا فالو اپ، رپورٹس، یا کسٹمر میسجز؟",
+                  "time": 1794817563628,
+                  "endTime": 1794817570048,
+                  "secondsFromStart": 38.34,
+                  "duration": 5940,
+                  "source": "",
+                  "assistantName": "Dummy Assistant for task",
+                  "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                },
+                {
+                  "role": "user",
+                  "message": "میسجز۔",
+                  "time": 1794817572874,
+                  "endTime": 1794817573294,
+                  "secondsFromStart": 47.586,
+                  "duration": 420,
+                  "metadata": {
+                    "wordLevelConfidence": [
+                      {
+                        "word": "می",
+                        "start": 47.58,
+                        "end": 47.64,
+                        "confidence": 0.952,
+                        "punctuated_word": "می",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "س",
+                        "start": 47.76,
+                        "end": 47.82,
+                        "confidence": 0.958,
+                        "punctuated_word": "س",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "ج",
+                        "start": 47.88,
+                        "end": 47.94,
+                        "confidence": 0.995,
+                        "punctuated_word": "ج",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "ز",
+                        "start": 47.94,
+                        "end": 48,
+                        "confidence": 0.826,
+                        "punctuated_word": "ز",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "۔",
+                        "start": 48,
+                        "end": 48,
+                        "confidence": 0.913,
+                        "punctuated_word": "۔",
+                        "language": "ur"
+                      }
+                    ]
+                  },
+                  "confidence": 0.9288000000000001,
+                  "confidenceSource": "derived"
+                },
+                {
+                  "role": "bot",
+                  "message": "کیا آپ نے کبھی اے آئی یا آٹومیشن استعمال کرنے کے بارے میں سوچا ہے؟",
+                  "time": 1794817574548,
+                  "endTime": 1794817577728,
+                  "secondsFromStart": 49.26,
+                  "duration": 3180,
+                  "source": "",
+                  "assistantName": "Dummy Assistant for task",
+                  "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                },
+                {
+                  "role": "user",
+                  "message": "جی۔",
+                  "time": 1794817579594,
+                  "endTime": 1794817579654,
+                  "secondsFromStart": 54.306,
+                  "duration": 60,
+                  "metadata": {
+                    "wordLevelConfidence": [
+                      {
+                        "word": "ج",
+                        "start": 54.3,
+                        "end": 54.36,
+                        "confidence": 1,
+                        "punctuated_word": "ج",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "ی",
+                        "start": 54.36,
+                        "end": 54.36,
+                        "confidence": 1,
+                        "punctuated_word": "ی",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "۔",
+                        "start": 54.36,
+                        "end": 54.36,
+                        "confidence": 0.997,
+                        "punctuated_word": "۔",
+                        "language": "ur"
+                      }
+                    ]
+                  },
+                  "confidence": 0.999,
+                  "confidenceSource": "derived"
+                },
+                {
+                  "role": "bot",
+                  "message": "اگر لاجک فاسٹ کی ٹیم، جس کو بلال نعیم لیڈ کرتے ہیں، آپ سے اس بارے میں بات کرے تو کیا آپ کو ٹھیک لگے گا؟",
+                  "time": 1794817580788,
+                  "endTime": 1794817586728,
+                  "secondsFromStart": 55.5,
+                  "duration": 5940,
+                  "source": "",
+                  "assistantName": "Dummy Assistant for task",
+                  "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                },
+                {
+                  "role": "user",
+                  "message": "جی۔",
+                  "time": 1794817588594,
+                  "endTime": 1794817588654,
+                  "secondsFromStart": 63.306,
+                  "duration": 60,
+                  "metadata": {
+                    "wordLevelConfidence": [
+                      {
+                        "word": "ج",
+                        "start": 63.3,
+                        "end": 63.36,
+                        "confidence": 1,
+                        "punctuated_word": "ج",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "ی",
+                        "start": 63.36,
+                        "end": 63.36,
+                        "confidence": 0.979,
+                        "punctuated_word": "ی",
+                        "language": "ur"
+                      },
+                      {
+                        "word": "۔",
+                        "start": 63.36,
+                        "end": 63.36,
+                        "confidence": 0.995,
+                        "punctuated_word": "۔",
+                        "language": "ur"
+                      }
+                    ]
+                  },
+                  "confidence": 0.9913333333333334,
+                  "confidenceSource": "derived"
+                },
+                {
+                  "role": "bot",
+                  "message": "ہماری ٹیم آپ سے جلد رابطہ کرے گی۔ آپ کا وقت دینے کا شکریہ، اللہ حافظ۔",
+                  "time": 1794817589848,
+                  "endTime": 1794817594408,
+                  "secondsFromStart": 64.56,
+                  "duration": 3900,
+                  "source": "",
+                  "assistantName": "Dummy Assistant for task",
+                  "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98"
+                }
+              ],
+              "recordingUrl": "https://94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/hipaa-recordings/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-1715d004-8b14-4ca4-99e8-e7a341fed3f6-mono.wav",
+              "stereoRecordingUrl": "https://94bdb67bb98da30b06bdd917725c037d.r2.cloudflarestorage.com/hipaa-recordings/01a1e376-048d-766a-a6a5-f4589f30fc3b-1794817607063-860f73d0-36c3-4b19-8792-cc877d28483b-stereo.wav",
+              "call": {
+                "id": "01a1e376-048d-766a-a6a5-f4589f30fc3b",
+                "orgId": "77faf4a1-931d-4df1-bcd0-25cd4e2b1624",
+                "createdAt": "2026-11-16T08:25:24.877Z",
+                "updatedAt": "2026-11-16T08:25:24.877Z",
+                "type": "webCall",
+                "cost": 0,
+                "monitor": {
+                  "listenUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production2.vapi.ai/01a1e376-048d-766a-a6a5-f4589f30fc3b/listen",
+                  "controlUrl": "https://phone-call-websocket.aws-us-west-2-backend-production2.vapi.ai/01a1e376-048d-766a-a6a5-f4589f30fc3b/control"
+                },
+                "transport": {
+                  "conversationType": "voice",
+                  "provider": "daily",
+                  "videoRecordingEnabled": false,
+                  "assistantVideoEnabled": false,
+                  "roomDeleteOnUserLeaveEnabled": true,
+                  "callUrl": "https://vapi.daily.co/eQMYL2nNsZzL6JeybzM0"
+                },
+                "webCallUrl": "https://vapi.daily.co/eQMYL2nNsZzL6JeybzM0",
+                "status": "queued",
+                "assistantId": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98",
+                "assistantVersion": "v9",
+                "assistantOverrides": {
+                  "name": "Dummy Assistant for task",
+                  "model": {
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                      {
+                        "role": "system",
+                        "content": "# FIRST MESSAGE (paste into the \"First Message\" field)\n\nAssalam-o-Alaikum! Main Logic Fast ka AI assistant hoon. Kya aap ke paas do minute hain?\n\n---\n\n# SYSTEM PROMPT (paste into the \"System Prompt\" field)\n\n# ROLE\nYou are the AI voice assistant of Logic Fast (spelled LogicFast in writing), a founder-led team in Gujranwala, Pakistan that builds websites, web apps, mobile apps and AI automations for businesses. You are making a short call to find out in 2 minutes or less whether Logic Fast's AI automation could help the person, and to note their interest. You are NOT here to sell hard or close a deal.\n\n# WHO YOU ARE CALLING\nDetails supplied for this call: name = {{name}}, company = {{company}}.\n- If a value is empty, missing, or still shows as a placeholder in curly braces, treat it as UNKNOWN. Never read a placeholder aloud.\n- NAME KNOWN: after they say they have two minutes, confirm once: \"Kya meri baat {{name}} se ho rahi hai?\" If they say no, ask politely for the right person or offer a callback.\n- NAME UNKNOWN: ask once: \"Aap ka naam kya hai?\" Then use their name naturally. Because the details are unknown, also ask for their company: \"Aap kis company ya business se hain?\"\n- If the name was unknown AND the person is interested or wants a callback, ask once before closing: \"Hamari team aap se rabta karne ke liye aap ka number kya hoga?\" Repeat the number back digit by digit to confirm.\n- If the name was known, do NOT ask for a phone number or any other personal data.\n\n# LANGUAGE AND STYLE\n- Speak in the same language the person uses: Urdu, Roman-Urdu style Hindi-Urdu, or English. Default to simple Urdu mixed with common English words.\n- Use gender-neutral phrasing for yourself (\"main Logic Fast ka AI assistant hoon\").\n- Say the company name as two words, \"Logic Fast\", clearly.\n- Sound warm, calm and respectful. Use \"aap\" always.\n- Keep every turn to 1-2 short sentences. Ask only ONE question at a time, then wait.\n- Never read lists aloud. Never use bullet points, markdown or emojis.\n\n# CALL FLOW\n1. OPENING (already spoken as the first message). If the person says it is the wrong person or a bad time, go to \"Callback\".\n2. If they have two minutes, handle \"WHO YOU ARE CALLING\" above (confirm the name, or ask for it).\n3. Ask these three questions, one at a time, reacting briefly to each answer:\n   a. \"Aap ke business mein kaun se kaam baar baar haath se karne parte hain, jaise leads follow-up, reports, ya customer messages?\"\n   b. \"Kya aap ne kabhi AI ya automation use karne ke baare mein socha hai?\"\n   c. \"Agar Logic Fast ki team, jis ko Bilal Naeem lead karte hain, aap se is baare mein baat kare, to kya aap ko theek lagega?\"\n4. If interested: (if details were unknown, collect the number as described above), thank them, say the team will contact them, and end the call.\n5. If not interested: thank them politely and end the call. Do not argue or try to change their mind more than once.\n\n# CALLBACK\nIf they are busy or ask to be called later, ask: \"Theek hai, aap kis din aur kis waqt call karna pasand karenge?\" Repeat the day and time back to confirm, thank them, and end the call. (If the name was unknown, also get their name and number as described above.)\n\n# OPT-OUT (HIGHEST PRIORITY)\nIf the person says anything like \"dobara call mat karo\", \"mujhe call na karein\", \"remove my number\", \"stop calling\" or \"do not call again\", in any language, stop immediately. Say once: \"Maazrat, main aap ka number abhi list se hata deti hoon, aap ko dobara call nahi aayegi. Shukriya, Allah hafiz.\" Then end the call. Do not ask why, and do not try to persuade them.\nA request like \"abhi nahi, kal call karna\" is a CALLBACK, not an opt-out.\n\n# WHAT YOU MAY SAY ABOUT LOGICFAST (only this, nothing more)\n- Logic Fast is a founder-led team in Gujranwala serving businesses across Pakistan. The founder, Bilal Naeem, personally leads every project.\n- Services: web development, AI automation, mobile apps, digital marketing, local SEO and Google Business Profile, website care and maintenance, and website security audits.\n- AI automation means practical automations that remove repetitive work, such as connecting workflows, processing documents, sorting enquiries, drafting routine messages and generating reports. Every automation includes human review checkpoints. If a task is not a good fit, they will say so honestly.\n- The price is always fixed and agreed in writing before work starts, with no hidden charges. A typical AI workflow automation is around PKR 50,000 to 150,000 and takes 2 to 4 weeks. The final quote depends on the scope.\n- The client owns the code, content, accounts and documentation.\n- There is a free website security audit on logicfast.co.\n- Contact: info@logicfast.co or logicfast.co.\n\n# RULES\n- At the very start you must have said you are an AI assistant. If asked, always confirm you are an AI. Never pretend to be human.\n- Never invent facts, clients, case studies, discounts, guarantees or timelines beyond the list above. Do not promise anything on behalf of the team.\n- If asked something you cannot answer from the list above (for example exact pricing for their case, a technical detail, contracts, or a specific client), do NOT guess. Say exactly: \"Yeh sawal mere paas jawab nahi hai, main isay team ke liye note kar leti hoon, wo aap ko bata denge.\" Then continue the call.\n- The only personal data you may ask for is the name, company and phone number described in \"WHO YOU ARE CALLING\", and only in that situation. Never ask for passwords, CNIC, bank or card details, or an email.\n- If they ask who gave you their number or are upset, apologise briefly and offer to remove them from the list.\n- If you reach voicemail or an answering machine, end the call without leaving a message.\n- If there is no response for several seconds, ask once \"Hello, kya aap mujhe sun pa rahe hain?\" and if there is still silence, end the call politely.\n- Keep the whole call under 3 minutes. Close with a short thank-you (\"Waqt dene ka shukriya, Allah hafiz\") and end the call."
+                      }
+                    ],
+                    "provider": "openai"
+                  },
+                  "voice": {
+                    "version": "2",
+                    "voiceId": "Elliot",
+                    "provider": "vapi"
+                  },
+                  "server": {
+                    "url": "https://safih1.app.n8n.cloud/webhook/vapi-end-of-call",
+                    "timeoutSeconds": 20
+                  },
+                  "metadata": {
+                    "preset": "balanced:1"
+                  },
+                  "transcriber": {
+                    "model": "stt-rt-v5",
+                    "language": "ur",
+                    "provider": "soniox",
+                    "languages": [
+                      "ur"
+                    ],
+                    "fallbackPlan": {
+                      "transcribers": [
+                        {
+                          "model": "flux-general-en",
+                          "language": "en",
+                          "provider": "deepgram"
+                        }
+                      ]
+                    }
+                  },
+                  "analysisPlan": {
+                    "summaryPlan": {
+                      "enabled": false
+                    },
+                    "successEvaluationPlan": {
+                      "enabled": false
+                    }
+                  },
+                  "firstMessage": "Hello.Yeh ek AI Call hai",
+                  "clientMessages": [
+                    "transcript",
+                    "hang",
+                    "metadata",
+                    "tool-calls",
+                    "tool-calls-result",
+                    "tool.completed",
+                    "transfer-update",
+                    "user-interrupted",
+                    "status-update",
+                    "assistant.started"
+                  ],
+                  "compliancePlan": {
+                    "pciEnabled": false,
+                    "zdrEnabled": false,
+                    "hipaaEnabled": false
+                  },
+                  "endCallMessage": "Goodbye.",
+                  "variableValues": {},
+                  "voicemailMessage": "Please call back when you're available.",
+                  "firstMessageInterruptionsEnabled": false
+                }
+              },
+              "assistant": {
+                "id": "2b7eda6c-a333-4ab1-8050-ba81c6bc3c98",
+                "orgId": "77faf4a1-931d-4df1-bcd0-25cd4e2b1624",
+                "name": "Dummy Assistant for task",
+                "voice": {
+                  "version": "2",
+                  "voiceId": "Elliot",
+                  "provider": "vapi"
+                },
+                "createdAt": "2026-11-15T13:31:53.043Z",
+                "updatedAt": "2026-11-15T19:02:19.798Z",
+                "model": {
+                  "model": "gpt-4o-mini",
+                  "messages": [
+                    {
+                      "role": "system",
+                      "content": "# FIRST MESSAGE (paste into the \"First Message\" field)\n\nAssalam-o-Alaikum! Main Logic Fast ka AI assistant hoon. Kya aap ke paas do minute hain?\n\n---\n\n# SYSTEM PROMPT (paste into the \"System Prompt\" field)\n\n# ROLE\nYou are the AI voice assistant of Logic Fast (spelled LogicFast in writing), a founder-led team in Gujranwala, Pakistan that builds websites, web apps, mobile apps and AI automations for businesses. You are making a short call to find out in 2 minutes or less whether Logic Fast's AI automation could help the person, and to note their interest. You are NOT here to sell hard or close a deal.\n\n# WHO YOU ARE CALLING\nDetails supplied for this call: name = {{name}}, company = {{company}}.\n- If a value is empty, missing, or still shows as a placeholder in curly braces, treat it as UNKNOWN. Never read a placeholder aloud.\n- NAME KNOWN: after they say they have two minutes, confirm once: \"Kya meri baat {{name}} se ho rahi hai?\" If they say no, ask politely for the right person or offer a callback.\n- NAME UNKNOWN: ask once: \"Aap ka naam kya hai?\" Then use their name naturally. Because the details are unknown, also ask for their company: \"Aap kis company ya business se hain?\"\n- If the name was unknown AND the person is interested or wants a callback, ask once before closing: \"Hamari team aap se rabta karne ke liye aap ka number kya hoga?\" Repeat the number back digit by digit to confirm.\n- If the name was known, do NOT ask for a phone number or any other personal data.\n\n# LANGUAGE AND STYLE\n- Speak in the same language the person uses: Urdu, Roman-Urdu style Hindi-Urdu, or English. Default to simple Urdu mixed with common English words.\n- Use gender-neutral phrasing for yourself (\"main Logic Fast ka AI assistant hoon\").\n- Say the company name as two words, \"Logic Fast\", clearly.\n- Sound warm, calm and respectful. Use \"aap\" always.\n- Keep every turn to 1-2 short sentences. Ask only ONE question at a time, then wait.\n- Never read lists aloud. Never use bullet points, markdown or emojis.\n\n# CALL FLOW\n1. OPENING (already spoken as the first message). If the person says it is the wrong person or a bad time, go to \"Callback\".\n2. If they have two minutes, handle \"WHO YOU ARE CALLING\" above (confirm the name, or ask for it).\n3. Ask these three questions, one at a time, reacting briefly to each answer:\n   a. \"Aap ke business mein kaun se kaam baar baar haath se karne parte hain, jaise leads follow-up, reports, ya customer messages?\"\n   b. \"Kya aap ne kabhi AI ya automation use karne ke baare mein socha hai?\"\n   c. \"Agar Logic Fast ki team, jis ko Bilal Naeem lead karte hain, aap se is baare mein baat kare, to kya aap ko theek lagega?\"\n4. If interested: (if details were unknown, collect the number as described above), thank them, say the team will contact them, and end the call.\n5. If not interested: thank them politely and end the call. Do not argue or try to change their mind more than once.\n\n# CALLBACK\nIf they are busy or ask to be called later, ask: \"Theek hai, aap kis din aur kis waqt call karna pasand karenge?\" Repeat the day and time back to confirm, thank them, and end the call. (If the name was unknown, also get their name and number as described above.)\n\n# OPT-OUT (HIGHEST PRIORITY)\nIf the person says anything like \"dobara call mat karo\", \"mujhe call na karein\", \"remove my number\", \"stop calling\" or \"do not call again\", in any language, stop immediately. Say once: \"Maazrat, main aap ka number abhi list se hata deti hoon, aap ko dobara call nahi aayegi. Shukriya, Allah hafiz.\" Then end the call. Do not ask why, and do not try to persuade them.\nA request like \"abhi nahi, kal call karna\" is a CALLBACK, not an opt-out.\n\n# WHAT YOU MAY SAY ABOUT LOGICFAST (only this, nothing more)\n- Logic Fast is a founder-led team in Gujranwala serving businesses across Pakistan. The founder, Bilal Naeem, personally leads every project.\n- Services: web development, AI automation, mobile apps, digital marketing, local SEO and Google Business Profile, website care and maintenance, and website security audits.\n- AI automation means practical automations that remove repetitive work, such as connecting workflows, processing documents, sorting enquiries, drafting routine messages and generating reports. Every automation includes human review checkpoints. If a task is not a good fit, they will say so honestly.\n- The price is always fixed and agreed in writing before work starts, with no hidden charges. A typical AI workflow automation is around PKR 50,000 to 150,000 and takes 2 to 4 weeks. The final quote depends on the scope.\n- The client owns the code, content, accounts and documentation.\n- There is a free website security audit on logicfast.co.\n- Contact: info@logicfast.co or logicfast.co.\n\n# RULES\n- At the very start you must have said you are an AI assistant. If asked, always confirm you are an AI. Never pretend to be human.\n- Never invent facts, clients, case studies, discounts, guarantees or timelines beyond the list above. Do not promise anything on behalf of the team.\n- If asked something you cannot answer from the list above (for example exact pricing for their case, a technical detail, contracts, or a specific client), do NOT guess. Say exactly: \"Yeh sawal mere paas jawab nahi hai, main isay team ke liye note kar leti hoon, wo aap ko bata denge.\" Then continue the call.\n- The only personal data you may ask for is the name, company and phone number described in \"WHO YOU ARE CALLING\", and only in that situation. Never ask for passwords, CNIC, bank or card details, or an email.\n- If they ask who gave you their number or are upset, apologise briefly and offer to remove them from the list.\n- If you reach voicemail or an answering machine, end the call without leaving a message.\n- If there is no response for several seconds, ask once \"Hello, kya aap mujhe sun pa rahe hain?\" and if there is still silence, end the call politely.\n- Keep the whole call under 3 minutes. Close with a short thank-you (\"Waqt dene ka shukriya, Allah hafiz\") and end the call."
+                    }
+                  ],
+                  "provider": "openai"
+                },
+                "firstMessage": "Hello.Yeh ek AI Call hai",
+                "voicemailMessage": "Please call back when you're available.",
+                "endCallMessage": "Goodbye.",
+                "transcriber": {
+                  "model": "stt-rt-v5",
+                  "language": "ur",
+                  "provider": "soniox",
+                  "languages": [
+                    "ur"
+                  ],
+                  "fallbackPlan": {
+                    "transcribers": [
+                      {
+                        "model": "flux-general-en",
+                        "language": "en",
+                        "provider": "deepgram"
+                      }
+                    ]
+                  }
+                },
+                "clientMessages": [
+                  "transcript",
+                  "hang",
+                  "metadata",
+                  "tool-calls",
+                  "tool-calls-result",
+                  "tool.completed",
+                  "transfer-update",
+                  "user-interrupted",
+                  "status-update",
+                  "assistant.started"
+                ],
+                "metadata": {
+                  "preset": "balanced:1"
+                },
+                "analysisPlan": {
+                  "summaryPlan": {
+                    "enabled": false
+                  },
+                  "successEvaluationPlan": {
+                    "enabled": false
+                  }
+                },
+                "server": {
+                  "url": "https://safih1.app.n8n.cloud/webhook/vapi-end-of-call",
+                  "timeoutSeconds": 20
+                },
+                "compliancePlan": {
+                  "pciEnabled": false,
+                  "zdrEnabled": false,
+                  "hipaaEnabled": false
+                },
+                "firstMessageInterruptionsEnabled": false,
+                "latestVersion": "v9"
+              },
+              "assistantVersion": "v9"
+            }
+          },
+          "webhookUrl": "https://safih1.app.n8n.cloud/webhook/vapi-end-of-call",
+          "executionMode": "production"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "VAPI Webhook1": {
+      "main": [
+        [
+          {
+            "node": "End-of-Call Report?1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "End-of-Call Report?1": {
+      "main": [
+        [
+          {
+            "node": "Parse Report1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Report1": {
+      "main": [
+        [
+          {
+            "node": "Transcript OK?1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcript OK?1": {
+      "main": [
+        [
+          {
+            "node": "Gemini Extract1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Non-Transcript Result1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Non-Transcript Result1": {
+      "main": [
+        [
+          {
+            "node": "Update Lead Row1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Extract1": {
+      "main": [
+        [
+          {
+            "node": "Build Final Result1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini Failed1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Final Result1": {
+      "main": [
+        [
+          {
+            "node": "Update Lead Row1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Failed1": {
+      "main": [
+        [
+          {
+            "node": "Update Lead Row1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Lead Row1": {
+      "main": [
+        [
+          {
+            "node": "Interested?1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interested?1": {
+      "main": [
+        [
+          {
+            "node": "Gmail Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "0de890ac-b50a-4801-a346-7eac806f0af7",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "6902e8e8d8a90e5b4e418817f9aba08bc3c7cc947dc709c2a5b86c1ce6b4be7e"
+  },
+  "nodeGroups": [],
+  "id": "hlboYYp0cf6rgO8e",
+  "tags": []
+}
